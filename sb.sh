@@ -1192,13 +1192,19 @@ do_install() {
     open_firewall "$base/tcp" "$((base+1))/udp" "$((base+2))/udp" "$((base+3))/tcp" \
                   "$((base+4))/tcp" "$((base+5))/tcp" "$((base+6))/tcp" "$((base+7))/tcp"
 
+    # 必须先落地 sb.sh / subsrv.py, 否则订阅服务(依赖 subsrv.py)起不来
+    install_shortcut
+
     if [ "$subp" != "0" ]; then
         svc sb-sub enable
         sleep 1
-        [ "$(svc sb-sub status)" = running ] && ok "订阅服务: $(sub_urls)" || warn "订阅服务未启动"
+        if [ "$(svc sb-sub status)" = running ]; then
+            ok "订阅服务: $(sub_urls)"
+        else
+            warn "订阅服务未启动, 日志:"
+            tail -5 "${LOG_DIR}/sb-sub.log" 2>/dev/null | sed 's/^/    /'
+        fi
     fi
-
-    install_shortcut
 
     if [ "${ENABLE_ARGO:-0}" = "1" ]; then
         add_proto vmess || warn "VMess-Argo 安装失败, 可稍后在菜单中重试"
