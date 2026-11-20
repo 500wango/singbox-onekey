@@ -1,0 +1,13 @@
+# 忽略测试产物与本地配置
+*.log
+/tmp/
+/etc/
+sub-dump/
+clash*.yaml
+!tests/*.yaml
+.DS_Store
+*.swp
+
+# Python
+__pycache__/
+*.pyc

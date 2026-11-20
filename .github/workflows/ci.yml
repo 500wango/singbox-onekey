@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning sb.sh tests/*.sh || true
+      - name: 静态检查
+        run: bash tests/lint.sh
+      - name: Python 编译
+        run: python3 -m py_compile subsrv.py
+
+  install-smoke:
+    # 在干净容器里跑一次真实安装 + 服务端自检(不做外网连通测试, 避免污染 CI)
+    runs-on: ubuntu-latest
+    container: debian:12
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装依赖
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq curl jq openssl python3 iproute2 ca-certificates
+      - name: 安装 sing-box
+        run: PORT=31500 bash sb.sh -i
+      - name: 校验服务端配置
+        run: /etc/sing-box/sing-box check -c /etc/sing-box/config.json
+      - name: 校验客户端配置
+        run: |
+          f=$(ls /etc/sing-box/sub/*/singbox.json)
+          /etc/sing-box/sing-box check -c "$f"
+      - name: 校验 Clash 订阅
+        run: |
+          t=$(jq -r .sub.token /etc/sing-box/meta.json)
+          grep -q 'proxies:' "/etc/sing-box/sub/$t/clash.yaml"
+      - name: 订阅服务可达
+        run: |
+          p=$(jq -r .sub.port /etc/sing-box/meta.json)
+          t=$(jq -r .sub.token /etc/sing-box/meta.json)
+          for f in "" sub clash.yaml singbox.json; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$p/$t/$f")
+            echo "/$f -> $code"; [ "$code" = "200" ] || exit 1
+          done
+          code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$p/wrongtoken/sub")
+          echo "bad token -> $code"; [ "$code" = "404" ] || exit 1
+      - name: 重装幂等
+        run: |
+          before=$(jq -c '{rp:.reality.port,sub:.sub.port,tok:.sub.token}' /etc/sing-box/meta.json)
+          bash sb.sh -i >/dev/null
+          after=$(jq -c '{rp:.reality.port,sub:.sub.port,tok:.sub.token}' /etc/sing-box/meta.json)
+          [ "$before" = "$after" ] && echo "idempotent ok" || { echo "changed: $before -> $after"; exit 1; }
