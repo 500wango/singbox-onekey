@@ -22,6 +22,8 @@ META="${WORK_DIR}/meta.json"
 SUB_DIR="${WORK_DIR}/sub"
 LOG_DIR="${WORK_DIR}/logs"
 SB_VERSION="${SB_VERSION:-latest}"
+# Reality 伪装目标: 需支持 TLS1.3 与 h2; 可用 SNI=xxx 覆盖
+DEFAULT_SNI="${DEFAULT_SNI:-www.iij.ad.jp}"
 
 # 环境变量:
 #   PORT=起始端口(连续占用 8 个) SNI=Reality伪装域名 UUID=指定UUID
@@ -828,7 +830,7 @@ build_client_configs() {
     hp=$(meta_get .hy2.port); tp=$(meta_get .tuic.port); ap=$(meta_get .anytls.port)
     sp=$(meta_get .ss2022.port); trp=$(meta_get .trojan.port); vp=$(meta_get .vmess.port)
     [ -n "$isp" ] || isp=node
-    [ -n "$sni" ] || sni=www.iij.ad.jp
+    [ -n "$sni" ] || sni=$DEFAULT_SNI
     d=$(sub_dir_of)
     mkdir -p "$d"; chmod 755 "$SUB_DIR" "$d"; : >"${d}/v2ray"
     # 清理遗留的旧订阅目录(重装/重置订阅路径后)
@@ -1072,8 +1074,27 @@ show_info() {
     line
     sed 's/^/  /' "${d}/v2ray" 2>/dev/null
     line
+    # 逐个节点生成二维码: 客户端扫 vless:// 才是"添加节点", 扫订阅 URL 行为不一致
+    if need qrencode && [ -s "${d}/v2ray" ]; then
+        local i=1 uri name qdir="${WORK_DIR}/qrcode"
+        mkdir -p "$qdir"; chmod 755 "$qdir"
+        while IFS= read -r uri; do
+            [ -n "$uri" ] || continue
+            name=${uri##*#}
+            printf '\n  %s[%d] %s%s\n' "$C_P" "$i" "$(printf '%s' "$name" | sed 's/-[a-z0-9]*$//')" "$C_N"
+            # 终端扫码对字体/行高敏感, 同时落一个 PNG 到磁盘更可靠
+            qrencode -o "${qdir}/node${i}.png" -s 8 -m 2 "$uri" 2>/dev/null
+            qrencode -t ANSIUTF8 -m 1 "$uri" 2>/dev/null
+            i=$((i+1))
+        done < "${d}/v2ray"
+        printf '\n'
+        ok "二维码 PNG 已保存: ${qdir}/node*.png (终端扫不出时用手机扫这个文件)"
+    fi
+    # 订阅二维码单独给, 明确标注用途
     if [ -n "$(sub_urls)" ] && need qrencode; then
-        qrencode -t ANSIUTF8 "$(sub_urls)sub" 2>/dev/null
+        printf '\n  %s订阅二维码%s (客户端里选"添加订阅", 不是"添加节点")\n' "$C_Y" "$C_N"
+        qrencode -o "${WORK_DIR}/qrcode/subscribe.png" -s 8 -m 2 "$(sub_urls)sub" 2>/dev/null
+        qrencode -t ANSIUTF8 -m 1 "$(sub_urls)sub" 2>/dev/null
     fi
     warn "Hy2/TUIC/AnyTLS/Trojan 使用自签证书, 客户端需开启 '跳过证书验证'"
 }
@@ -1122,7 +1143,7 @@ add_proto() {
     case "$t" in
         reality)
             reality_keypair; p=$(pick_one "$b" tcp)
-            jq --argjson p "$p" --arg pk "$RK_PRIV" --arg pub "$RK_PUB" --arg sid "$RK_SID" --arg sni "${SNI:-www.iij.ad.jp}" \
+            jq --argjson p "$p" --arg pk "$RK_PRIV" --arg pub "$RK_PUB" --arg sid "$RK_SID" --arg sni "${SNI:-$DEFAULT_SNI}" \
                '.reality={port:$p,sni:$sni,private_key:$pk,public_key:$pub,short_id:$sid}' \
                "$META" >"${META}.tmp" && mv "${META}.tmp" "$META" ;;
         hy2)
@@ -1365,7 +1386,7 @@ do_install() {
       --arg rk "$RK_PRIV" --arg rpub "$RK_PUB" --arg rsid "$RK_SID" \
       --arg hy "$(gen_secret 24)" --arg tp "$(gen_secret 24)" \
       --arg ap "$(gen_secret 24)" --arg tr "$(gen_secret 24)" \
-      --arg sni "${SNI:-www.iij.ad.jp}" --arg csha "$CERT_SHA" \
+      --arg sni "${SNI:-$DEFAULT_SNI}" --arg csha "$CERT_SHA" \
       --arg cfip "${CFIP:-cdns.doon.eu.org}" --arg cfport "${CFPORT:-443}" \
       --arg tok "${KEEP_TOKEN:-$(gen_secret 20)}" --arg ts "$(date '+%F %T')" \
       --arg keep "${KEEP_ENABLED:-reality,hy2,tuic,anytls}" \
