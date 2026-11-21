@@ -65,7 +65,7 @@ sb -h               # 帮助
 | `ARGO_AUTH` | 空 | 固定隧道 Token 或 credentials JSON |
 | `SUB_PORT` | `PORT+6` | 订阅服务端口 |
 | `DISABLE_SUB` | `0` | 设为 `1` 不安装订阅服务 |
-| `OPEN_PORTS` | `auto` | `auto`=检测到启用中的 ufw/firewalld 就自动放行；`1`=没有这两者时也用 nft/iptables 直插规则；`0`=完全跳过 |
+| `OPEN_PORTS` | `auto` | `auto`=自动放行本机所有会拦入站的防火墙；`1`=连没有 drop 策略的也建显式白名单；`0`=完全跳过 |
 | `CFIP` / `CFPORT` | `cdns.doon.eu.org` / `443` | Argo 节点优选域名与端口 |
 | `SB_VERSION` | `latest` | 固定内核版本，如 `1.14.4` |
 
@@ -92,7 +92,8 @@ ENABLE_ARGO=1 ARGO_DOMAIN=node.example.com ARGO_AUTH=<token> PORT=22000 bash <(c
 - **内置的 mmdb / rule-set 一个都不下载**。服务端只做 inbound → direct 转发，不在服务器上跑分流规则，减少外部依赖与失败点。
 - **端口独占检查**。脚本维护已占用端口表，新增协议不会抢走预留端口。
 - **重装幂等**。不带 `PORT` 重装时沿用原端口块、订阅端口、订阅 token 与已启用协议列表，客户端订阅不会失效。
-- **不做系统级破坏**。不修改 iptables 默认策略，不改 hosts，不装 nginx。防火墙只在检测到 ufw/firewalld 处于启用状态时才动，且只加放行规则，不加任何拒绝规则。
+- **不做系统级破坏**。不修改任何防火墙的默认策略，不改 hosts，不装 nginx。只追加 ACCEPT 放行规则，不加任何拒绝规则、不删任何现有规则。
+- **放行覆盖四层防火墙**。ufw / firewalld / nftables 独立表 / iptables。尤其 nftables 的独立 `inet` 表（如第三方项目自建的 policy drop 表）用 `iptables -L` 完全看不到，是最容易被忽略的一层，脚本会解析 `nft -j list ruleset` 找出所有 `hook input + policy drop` 的链并插入规则，写完后回读验证，失败会明确报错而不是假报成功。
 - **装完会自检端口**。光看进程在跑不代表外部能连，所以安装结束会逐端口检查监听/本机连通，并提示如何从外部验证。
 
 ## 反向代理 / 已有 nginx

@@ -229,48 +229,107 @@ pick_one() { # 单个新协议用: 从起始值向上找第一个空闲且未被
 }
 
 open_firewall() { # open_firewall 20338/tcp 20339/udp ...
-    # 默认 auto: 本机真正启用了 ufw / firewalld 才动它, 没防火墙就什么都不做
-    #   OPEN_PORTS=0    完全跳过
-    #   OPEN_PORTS=1    额外用 nft / iptables 直插放行规则(无 ufw/firewalld 时)
+    # 策略: 把本机所有"会拦入站"的防火墙都放行, 覆盖四层
+    #   1. ufw        2. firewalld
+    #   3. nftables: 优先往"已存在且 hook input 且 policy drop"的表里插规则
+    #      (这是最容易漏的一层: 独立 inet 表, iptables -L 完全看不到)
+    #   4. iptables: policy drop 时才需要插
+    # OPEN_PORTS=0 跳过; OPEN_PORTS=1 额外在无 drop 策略时也建规则(显式白名单)
     local mode=${OPEN_PORTS:-auto}
     if [ "$mode" = "0" ]; then
         info "已跳过防火墙配置 (OPEN_PORTS=0)"
         return 0
     fi
+
     local r p pr touched=0
+
+    # ---------- 1. ufw ----------
     if need ufw && ufw status 2>/dev/null | grep -qi active; then
         for r in "$@"; do p=${r%/*}; pr=${r#*/}; ufw allow in "${p}/${pr}" >/dev/null 2>&1; done
         ok "ufw 已放行: $*"
         touched=1
     fi
+
+    # ---------- 2. firewalld ----------
     if need firewall-cmd && systemctl is-active firewalld >/dev/null 2>&1; then
         for r in "$@"; do p=${r%/*}; pr=${r#*/}; firewall-cmd --permanent --add-port="${p}/${pr}" >/dev/null 2>&1; done
         firewall-cmd --reload >/dev/null 2>&1
         ok "firewalld 已放行: $*"
         touched=1
     fi
-    if [ "$mode" = "1" ] && [ "$touched" -eq 0 ]; then
-        if need nft; then
+
+    # ---------- 3. nftables (含独立表) ----------
+    local nft_chains=""
+    if need nft; then
+        # 找出所有 hook input 且 policy drop 的链; 注意 nft -j 里表名在 chain.table
+        nft_chains=$(nft -j list ruleset 2>/dev/null | jq -r '
+            .nftables[]?
+            | select(has("chain"))
+            | .chain
+            | select((.hook // "") == "input" and (.policy // "accept") == "drop")
+            | "\(.family)\u001f\(.table)\u001f\(.name)"' 2>/dev/null | sort -u)
+    fi
+    if [ -n "$nft_chains" ]; then
+        local fam tbl chn added
+        while IFS=$'\x1f' read -r fam tbl chn; do
+            [ -n "$fam" ] && [ -n "$tbl" ] && [ -n "$chn" ] || continue
+            added=0
             for r in "$@"; do
                 p=${r%/*}; pr=${r#*/}
-                nft list chain inet filter input >/dev/null 2>&1 && \
-                    nft insert rule inet filter input tcp dport "$p" accept 2>/dev/null
-                case "$pr" in udp) nft list chain inet filter input >/dev/null 2>&1 && \
-                    nft insert rule inet filter input udp dport "$p" accept 2>/dev/null ;; esac
+                # insert 默认加到链首, 保证先于 drop 命中
+                if nft insert rule "$fam" "$tbl" "$chn" "$pr" dport "$p" counter accept 2>/tmp/nft_err; then
+                    added=$((added+1))
+                else
+                    err "nft 放行失败 ($fam $tbl $chn $pr $p): $(tr -d '\n' </tmp/nft_err)"
+                fi
             done
-            ok "nftables 已放行: $* (重启后可能失效, 需自行持久化)"
+            if [ "$added" -gt 0 ]; then
+                # 回读验证: 确认规则真的在链里
+                if nft list chain "$fam" "$tbl" "$chn" 2>/dev/null | grep -q "dport"; then
+                    ok "nftables 已放行 $added 条规则 (表: $fam $tbl, 链: $chn)"
+                else
+                    err "nft 规则写入后回读失败 (表: $fam $tbl)"
+                fi
+                touched=1
+            fi
+        done <<< "$nft_chains"
+        warn "nft 规则是内存态, 重启后失效。持久化: nft list ruleset > /etc/nftables.conf && systemctl enable nftables"
+    elif [ "$mode" = "1" ] && need nft && nft list chain inet filter input >/dev/null 2>&1; then
+        for r in "$@"; do
+            p=${r%/*}; pr=${r#*/}
+            nft insert rule inet filter input "$pr" dport "$p" counter accept 2>/dev/null
+        done
+        ok "nftables(inet filter) 已放行: $*"
+        touched=1
+    fi
+
+    # ---------- 4. iptables (policy drop 才需要) ----------
+    if need iptables; then
+        local pol
+        pol=$(iptables -S INPUT 2>/dev/null | awk '/^-P INPUT/ {print $3; exit}')
+        if [ "$pol" = "DROP" ]; then
+            for r in "$@"; do
+                p=${r%/*}; pr=${r#*/}
+                iptables -C INPUT -p "$pr" --dport "$p" -j ACCEPT 2>/dev/null || \
+                    iptables -I INPUT 1 -p "$pr" --dport "$p" -j ACCEPT 2>/dev/null
+            done
+            ok "iptables(INPUT policy drop) 已放行: $*"
+            warn "iptables 规则重启后可能失效, 持久化: netfilter-persistent save 或 iptables-save > /etc/iptables/rules.v4"
             touched=1
-        elif need iptables; then
+        elif [ "$mode" = "1" ]; then
             for r in "$@"; do
                 p=${r%/*}; pr=${r#*/}
                 iptables -C INPUT -p "$pr" --dport "$p" -j ACCEPT 2>/dev/null || \
                     iptables -I INPUT 2 -p "$pr" --dport "$p" -j ACCEPT 2>/dev/null
             done
-            ok "iptables 已放行: $* (重启后可能失效, 需自行持久化)"
+            ok "iptables 已放行: $*"
             touched=1
         fi
     fi
-    [ "$touched" -eq 0 ] && info "未检测到启用中的本机防火墙 (iptables/nft 默认策略视为已放行)"
+
+    [ "$touched" -eq 0 ] && info "本机未检测到会拦截入站的防火墙 (ufw/firewalld/nft/iptables 均放行)"
+    # 云厂商安全组是另一层, 脚本改不了, 必须提醒
+    printf '  %s注意%s: 云厂商安全组(AWS/阿里云/腾讯云/Contabo 等)需在控制台单独放行, 脚本无法修改。\n' "$C_Y" "$C_N"
     return 0
 }
 

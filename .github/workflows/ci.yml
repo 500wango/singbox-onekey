@@ -59,3 +59,59 @@ jobs:
           bash sb.sh -i >/dev/null
           after=$(jq -c '{rp:.reality.port,sub:.sub.port,tok:.sub.token}' /etc/sing-box/meta.json)
           [ "$before" = "$after" ] && echo "idempotent ok" || { echo "changed: $before -> $after"; exit 1; }
+
+  firewall-nft:
+    # 回归: 独立 nft 表 policy drop 时必须被放行(用户真实踩过的坑)
+    runs-on: ubuntu-latest
+    container:
+      image: debian:12
+      options: --cap-add=NET_ADMIN --cap-add=NET_RAW
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装依赖
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq curl jq openssl python3 iproute2 nftables ca-certificates
+      - name: 造一个独立的 policy drop 表(模拟第三方项目的 nft 表)
+        run: |
+          nft add table inet thirdparty
+          nft 'add chain inet thirdparty input { type filter hook input priority filter; policy drop; }'
+          nft add rule inet thirdparty input iifname "lo" accept
+          nft add rule inet thirdparty input ct state established,related accept
+          nft add rule inet thirdparty input tcp dport 22 accept
+          echo "--- 初始状态 ---"
+          nft list table inet thirdparty
+      - name: 运行安装(应自动把端口插进第三方的 drop 表)
+        run: PORT=32600 bash sb.sh -i
+      - name: 断言 1 - 规则确实写进了那张独立的表
+        run: |
+          nft list table inet thirdparty
+          for p in 32600 32603 32606; do
+            nft list table inet thirdparty | grep -q "dport $p" \
+              || { echo "缺少放行规则: 端口 $p 未插入"; exit 1; }
+          done
+          for p in 32601 32602; do
+            nft list table inet thirdparty | grep -q "udp dport $p" \
+              || { echo "缺少 UDP 放行规则: 端口 $p"; exit 1; }
+          done
+          echo "所有端口已写入 nft 表"
+      - name: 断言 2 - 规则在 drop 之前(insert 到链首)
+        run: |
+          first=$(nft list table inet thirdparty | grep -n "dport 32600" | head -1 | cut -d: -f1)
+          lo=$(nft list table inet thirdparty | grep -n 'iifname "lo"' | head -1 | cut -d: -f1)
+          echo "accept 行号=$first  lo 行号=$lo"
+          [ "$first" -lt "$lo" ] && echo "顺序正确: accept 在 lo 之前(必在 drop 之前)" || { echo "顺序错误"; exit 1; }
+      - name: 断言 3 - 本机自连真的通了(证明规则生效, 不只是写进去)
+        run: |
+          IP=$(hostname -I | awk '{print $1}')
+          echo "容器IP=$IP"
+          timeout 5 bash -c "echo > /dev/tcp/$IP/32600" && echo "TCP 32600 通" || { echo "TCP 32600 仍被拦"; exit 1; }
+          timeout 5 bash -c "echo > /dev/tcp/$IP/32606" && echo "TCP 32606(订阅) 通" || { echo "订阅端口仍被拦"; exit 1; }
+      - name: 断言 4 - 未放行的端口仍被 drop(没有全开)
+        run: |
+          IP=$(hostname -I | awk '{print $1}')
+          if timeout 4 bash -c "echo > /dev/tcp/$IP/32699" 2>/dev/null; then
+            echo "错误: 未放行的 32699 竟然通了, 说明规则过宽"; exit 1
+          else
+            echo "正确: 未放行端口 32699 仍被拦"
+          fi
