@@ -405,6 +405,43 @@ check_ports_report() { # check_ports_report <base> <subp>
     else
         ok "已启用协议的端口在本机侧全部就绪"
     fi
+
+    # 云厂商安全组放行清单(脚本改不到这一层, 直接给出可复制的规则)
+    local need_tcp="" need_udp="" t
+    for r in \
+        "$base/tcp:$((base+0)):reality" \
+        "$((base+1))/udp:$((base+1)):hy2" \
+        "$((base+2))/udp:$((base+2)):tuic" \
+        "$((base+3))/tcp:$((base+3)):anytls" \
+        "$((base+4))/tcp:$((base+4)):trojan" \
+        "$((base+5))/tcp:$((base+5)):ss2022" \
+        "$((base+6))/tcp:$((base+6)):订阅" \
+        "$((base+7))/tcp:$((base+7)):vmess/argo"
+    do
+        # 注意: local 不能在同一行给多个变量赋值(bash 陷阱), 分开写
+        local rp2="${r%%:*}"
+        local rest2="${r#*:}"
+        local pname2="${rest2#*:}"
+        local keep=0
+        case "$pname2" in
+            reality|hy2|tuic|anytls|trojan|ss2022) proto_on "$pname2" && keep=1 ;;
+            vmess/argo) proto_on vmess && keep=1 ;;
+            *) keep=1 ;;
+        esac
+        [ "$keep" -eq 1 ] || continue
+        case "${rp2#*/}" in
+            udp) need_udp="$need_udp ${rp2%/*}" ;;
+            *)   need_tcp="$need_tcp ${rp2%/*}" ;;
+        esac
+    done
+    printf '\n  %s云厂商安全组需要放行的端口%s (脚本改不到, 需在控制台手动加):\n' "$C_Y" "$C_N"
+    [ -n "$(echo $need_tcp | tr -d ' ')" ] && \
+        printf '    TCP  %s\n' "$(echo $need_tcp | tr ' ' ',' | sed 's/,/, /g')"
+    [ -n "$(echo $need_udp | tr -d ' ')" ] && \
+        printf '    UDP  %s\n' "$(echo $need_udp | tr ' ' ',' | sed 's/,/, /g')"
+    printf '    省事做法: 直接放行 TCP %s-%s 与 UDP %s-%s 整段\n' "$base" "$((base+7))" "$base" "$((base+7))"
+    printf '    别忘了保留 TCP 22 (SSH), 否则会把自己锁在外面\n'
+
     printf '\n  %s本机侧正常 ≠ 外部能连%s。从另一台机器验证:\n' "$C_Y" "$C_N"
     printf '    curl -m 5 http://%s:%s/     (订阅端口, 返回 404 正常; 超时=被拦)\n' "${pub:-你的公网IP}" "$subp"
     printf '    nc -vz %s %s\n' "${pub:-你的公网IP}" "$base"
