@@ -65,14 +65,17 @@ sb -h               # 帮助
 | `ARGO_AUTH` | 空 | 固定隧道 Token 或 credentials JSON |
 | `SUB_PORT` | `PORT+6` | 订阅服务端口 |
 | `DISABLE_SUB` | `0` | 设为 `1` 不安装订阅服务 |
-| `OPEN_PORTS` | `0` | 设为 `1` 自动放行 ufw / firewalld |
+| `OPEN_PORTS` | `auto` | `auto`=检测到启用中的 ufw/firewalld 就自动放行；`1`=没有这两者时也用 nft/iptables 直插规则；`0`=完全跳过 |
 | `CFIP` / `CFPORT` | `cdns.doon.eu.org` / `443` | Argo 节点优选域名与端口 |
 | `SB_VERSION` | `latest` | 固定内核版本，如 `1.14.4` |
 
 示例：
 
 ```bash
-# 指定端口段并自动放行防火墙
+# 指定端口段（防火墙有 ufw/firewalld 会自动放行）
+PORT=22000 bash <(curl -Ls .../sb.sh)
+
+# 没有任何防火墙管理工具时，也强制直插 iptables/nft 放行
 PORT=22000 OPEN_PORTS=1 bash <(curl -Ls .../sb.sh)
 
 # 同时安装 Argo 节点（临时隧道）
@@ -89,7 +92,8 @@ ENABLE_ARGO=1 ARGO_DOMAIN=node.example.com ARGO_AUTH=<token> PORT=22000 bash <(c
 - **内置的 mmdb / rule-set 一个都不下载**。服务端只做 inbound → direct 转发，不在服务器上跑分流规则，减少外部依赖与失败点。
 - **端口独占检查**。脚本维护已占用端口表，新增协议不会抢走预留端口。
 - **重装幂等**。不带 `PORT` 重装时沿用原端口块、订阅端口、订阅 token 与已启用协议列表，客户端订阅不会失效。
-- **不做系统级破坏**。不修改 iptables 默认策略，不改 hosts，不装 nginx，`OPEN_PORTS=1` 才动防火墙，且只加放行规则。
+- **不做系统级破坏**。不修改 iptables 默认策略，不改 hosts，不装 nginx。防火墙只在检测到 ufw/firewalld 处于启用状态时才动，且只加放行规则，不加任何拒绝规则。
+- **装完会自检端口**。光看进程在跑不代表外部能连，所以安装结束会逐端口检查监听/本机连通，并提示如何从外部验证。
 
 ## 反向代理 / 已有 nginx
 
@@ -124,3 +128,29 @@ tests/check_ports.sh 服务端监听端口检查（不依赖 ss/netstat）
 ## License
 
 MIT
+
+## 排障: 装完了但客户端连不上
+
+先跑 `sb -p`（端口自检），它会逐端口告诉你是哪种情况:
+
+| 自检结果 | 含义 | 处理 |
+| --- | --- | --- |
+| `未监听` | 进程没在听这个端口 | 看 `/etc/sing-box/logs/sing-box.log`，多为配置或端口占用 |
+| `本机拒连` | 回环都连不上 | 服务异常，`sb -r` 重启后看日志 |
+| `仅内网` | 本机公网 IP 连不上自己 | NAT 型机器，需在商家面板做端口映射 |
+| `正常` | 本机侧没问题 | 拦截在上游，看下面 |
+
+**本机正常但外部连不上**，按顺序查:
+
+1. 云厂商安全组 / 防火墙面板。脚本只能改机器内部防火墙，改不了控制台。阿里云、腾讯云、AWS、GCP、Contabo 都要在面板单独放行，TCP 和 UDP 要分别放。
+2. 上游机房端口过滤。在另一台机器上从外部验证:
+   ```bash
+   curl -m 5 http://<VPS_IP>:<订阅端口>/    # 返回 404 说明通了; 超时=被拦
+   nc -vz <VPS_IP> <节点端口>
+   ```
+   注意区分:**超时**说明数据包被丢弃（防火墙/上游拦截）；**connection refused** 说明包到了但没人监听（本地问题）。
+3. NAT 型机器要在商家面板把端口映射出来，并把映射后的端口传给 `PORT`。
+
+**Hysteria2 / TUIC 显示延迟 -1** 不一定是故障: 这两个协议走 UDP，而多数客户端（如 v2rayN 的 TCP 测速）测不到 UDP。判断这两个节点要看能否实际上网，不要看延迟数字。
+
+**REALITY: processed invalid connection** 是 Reality 的正常行为: 探测到非客户端流量时回落到伪装站点，不是错误。

@@ -228,18 +228,128 @@ pick_one() { # 单个新协议用: 从起始值向上找第一个空闲且未被
     printf '%s' "$1"
 }
 
-open_firewall() {
-    [ "${OPEN_PORTS:-0}" = "1" ] || return 0
-    local r p pr
+open_firewall() { # open_firewall 20338/tcp 20339/udp ...
+    # 默认 auto: 本机真正启用了 ufw / firewalld 才动它, 没防火墙就什么都不做
+    #   OPEN_PORTS=0    完全跳过
+    #   OPEN_PORTS=1    额外用 nft / iptables 直插放行规则(无 ufw/firewalld 时)
+    local mode=${OPEN_PORTS:-auto}
+    if [ "$mode" = "0" ]; then
+        info "已跳过防火墙配置 (OPEN_PORTS=0)"
+        return 0
+    fi
+    local r p pr touched=0
     if need ufw && ufw status 2>/dev/null | grep -qi active; then
         for r in "$@"; do p=${r%/*}; pr=${r#*/}; ufw allow in "${p}/${pr}" >/dev/null 2>&1; done
-        ok "已放行 ufw: $*"
+        ok "ufw 已放行: $*"
+        touched=1
     fi
     if need firewall-cmd && systemctl is-active firewalld >/dev/null 2>&1; then
         for r in "$@"; do p=${r%/*}; pr=${r#*/}; firewall-cmd --permanent --add-port="${p}/${pr}" >/dev/null 2>&1; done
         firewall-cmd --reload >/dev/null 2>&1
-        ok "已放行 firewalld: $*"
+        ok "firewalld 已放行: $*"
+        touched=1
     fi
+    if [ "$mode" = "1" ] && [ "$touched" -eq 0 ]; then
+        if need nft; then
+            for r in "$@"; do
+                p=${r%/*}; pr=${r#*/}
+                nft list chain inet filter input >/dev/null 2>&1 && \
+                    nft insert rule inet filter input tcp dport "$p" accept 2>/dev/null
+                case "$pr" in udp) nft list chain inet filter input >/dev/null 2>&1 && \
+                    nft insert rule inet filter input udp dport "$p" accept 2>/dev/null ;; esac
+            done
+            ok "nftables 已放行: $* (重启后可能失效, 需自行持久化)"
+            touched=1
+        elif need iptables; then
+            for r in "$@"; do
+                p=${r%/*}; pr=${r#*/}
+                iptables -C INPUT -p "$pr" --dport "$p" -j ACCEPT 2>/dev/null || \
+                    iptables -I INPUT 2 -p "$pr" --dport "$p" -j ACCEPT 2>/dev/null
+            done
+            ok "iptables 已放行: $* (重启后可能失效, 需自行持久化)"
+            touched=1
+        fi
+    fi
+    [ "$touched" -eq 0 ] && info "未检测到启用中的本机防火墙 (iptables/nft 默认策略视为已放行)"
+    return 0
+}
+
+# ------------------------------ 端口可达性自检 ------------------------------
+# 判断"本机在看/本机可连/外部可连", 把"配置错/防火墙拦/上游拦"三种情况区分开
+public_ipv4() {
+    local ip
+    ip=$(curl -4 -fsm 5 https://api.ipify.org 2>/dev/null || curl -4 -fsm 5 https://ip.sb 2>/dev/null)
+    printf '%s' "$ip"
+}
+
+port_reachable() { # port_reachable <port> <tcp|udp>
+    local p=$1 pr=$2
+    # 1) 本机是否在监听
+    local listening=0
+    if need ss; then
+        if [ "$pr" = udp ]; then
+            ss -Hlun 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$" && listening=1
+        else
+            ss -Hltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$" && listening=1
+        fi
+    fi
+    [ "$listening" -eq 1 ] || { printf 'notlistening'; return; }
+    [ "$pr" = udp ] && { printf 'ok'; return; }   # UDP 无法用 TCP 探测, 监听即可
+    # 2) 本机回环连通
+    timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/$p" 2>/dev/null || { printf 'localblocked'; return; }
+    # 3) 用本机公网 IP 自连(能测出仅本机可达的 NAT 情况)
+    local pub tgt
+    pub=$(public_ipv4)
+    [ -n "$pub" ] && tgt=$pub || tgt=127.0.0.1
+    timeout 4 bash -c "echo > /dev/tcp/$tgt/$p" 2>/dev/null || { printf 'natonly'; return; }
+    printf 'ok'
+}
+
+check_ports_report() { # check_ports_report <base> <subp>
+    local base=$1 subp=$2 r res bad=0 pub pname
+    pub=$(public_ipv4)
+    line
+    title "  端口自检"
+    line
+    printf '  %-7s %-5s %-10s %-8s %s\n' 端口 协议 用途 本机状态 结果
+    for r in \
+        "$base/tcp:$((base+0)):reality" \
+        "$((base+1))/udp:$((base+1)):hy2" \
+        "$((base+2))/udp:$((base+2)):tuic" \
+        "$((base+3))/tcp:$((base+3)):anytls" \
+        "$((base+4))/tcp:$((base+4)):trojan" \
+        "$((base+5))/tcp:$((base+5)):ss2022" \
+        "$((base+6))/tcp:$((base+6)):订阅" \
+        "$((base+7))/tcp:$((base+7)):vmess/argo"
+    do
+        local rp=${r%%:*} rest=${r#*:}
+        local pn=${rest%%:*} pname=${rest#*:}
+        # 只检查已启用协议对应的端口; 未启用的跳过
+        local noskip=0
+        case "$pname" in
+            reality|hy2|tuic|anytls|trojan|ss2022) proto_on "$pname" && noskip=1 ;;
+            vmess/argo) proto_on vmess && noskip=1 ;;
+            *) noskip=1 ;;
+        esac
+        [ "$noskip" -eq 0 ] && continue
+        res=$(port_reachable "${rp%/*}" "${rp#*/}")
+        case "$res" in
+            ok)           printf '  %-7s %-5s %-10s %-8s %s\n' "${rp%/*}" "${rp#*/}" "$pname" "监听中" "${C_G}正常${C_N}" ;;
+            notlistening) printf '  %-7s %-5s %-10s %-8s %s\n' "${rp%/*}" "${rp#*/}" "$pname" "未监听" "${C_R}异常${C_N}"; bad=1 ;;
+            localblocked) printf '  %-7s %-5s %-10s %-8s %s\n' "${rp%/*}" "${rp#*/}" "$pname" "本机拒连" "${C_R}异常${C_N}"; bad=1 ;;
+            natonly)      printf '  %-7s %-5s %-10s %-8s %s\n' "${rp%/*}" "${r#*/}" "$pname" "仅内网" "${C_Y}需映射${C_N}"; bad=1 ;;
+        esac
+    done
+    line
+    if [ "$bad" -ne 0 ]; then
+        warn "存在异常端口。若上面显示'未监听'但服务在跑, 先看 $LOG_DIR/sing-box.log"
+    else
+        ok "已启用协议的端口在本机侧全部就绪"
+    fi
+    printf '\n  %s本机侧正常 ≠ 外部能连%s。从另一台机器验证:\n' "$C_Y" "$C_N"
+    printf '    curl -m 5 http://%s:%s/     (订阅端口, 返回 404 正常; 超时=被拦)\n' "${pub:-你的公网IP}" "$subp"
+    printf '    nc -vz %s %s\n' "${pub:-你的公网IP}" "$base"
+    printf '  若外部超时而本机正常, 拦截在云厂商安全组或上游机房, 需在控制台放行或开工单。\n'
 }
 
 # ------------------------------ 内核安装 ------------------------------
@@ -1214,6 +1324,8 @@ do_install() {
     echo
     show_info
     echo
+    check_ports_report "$base" "$subp"
+    echo
     ok "安装完成, 输入 sb 管理"
 }
 
@@ -1348,7 +1460,8 @@ menu() {
    8) 更新 sing-box 内核
    9) 重新生成 TLS 证书
   10) 查看日志
-  11) 卸载 sing-box
+  11) 端口自检 (排查连不上)
+  12) 卸载 sing-box
    0) 退出
 EOM
         line
@@ -1370,7 +1483,8 @@ EOM
                jq --arg s "$CERT_SHA" '.cert_sha256=$s' "$META" >"${META}.tmp" && mv "${META}.tmp" "$META"
                reload_service && build_client_configs && ok "证书已更新" ;;
             10) show_log ;;
-            11) do_uninstall; return ;;
+            11) check_ports_report "$(meta_get .reality.port)" "$(meta_get .sub.port)" ;;
+            12) do_uninstall; return ;;
             0) exit 0 ;;
             *) continue ;;
         esac
@@ -1385,6 +1499,7 @@ sing-box 一键脚本
   sb                 交互菜单 (未安装则直接安装)
   sb -i              无交互安装
   sb -c              查看节点与订阅
+  sb -p              端口自检 (装完连不上时先跑这个)
   sb -r              重启服务
   sb -v              内核版本
   sb -u              卸载
@@ -1393,11 +1508,13 @@ sing-box 一键脚本
 环境变量:
   PORT=起始端口        SNI=Reality伪装域名      UUID=指定UUID
   ENABLE_ARGO=1        ARGO_DOMAIN=xx           ARGO_AUTH=token|json
-  SUB_PORT=端口        DISABLE_SUB=1            OPEN_PORTS=1 (自动放行防火墙)
+  SUB_PORT=端口        DISABLE_SUB=1
+  OPEN_PORTS=auto|1|0 防火墙放行: auto=有ufw/firewalld才动(默认) 1=强制 0=跳过
   CFIP / CFPORT        SB_VERSION=固定内核版本
 
 示例:
-  PORT=22000 OPEN_PORTS=1 bash <(curl -Ls ${SB_RAW_URL})
+  PORT=22000 bash <(curl -Ls ${SB_RAW_URL})
+  PORT=22000 OPEN_PORTS=1 bash <(curl -Ls ${SB_RAW_URL})   # 无 ufw/firewalld 时也直插 iptables
   ENABLE_ARGO=1 PORT=22000 bash <(curl -Ls ${SB_RAW_URL})
 EOF
 }
@@ -1406,6 +1523,7 @@ main() {
     case "${1:-}" in
         -i|--install)   require_root; do_install ;;
         -c|--check)     show_info ;;
+        -p|--ports)     detect_os; check_ports_report "$(meta_get .reality.port)" "$(meta_get .sub.port)" ;;
         -r|--restart)   require_root; reload_service ;;
         -v|--version)   [ -x "$BIN" ] && "$BIN" version || err "未安装" ;;
         -u|--uninstall) require_root; detect_os; do_uninstall ;;
