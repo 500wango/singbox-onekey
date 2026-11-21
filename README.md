@@ -154,3 +154,22 @@ MIT
 **Hysteria2 / TUIC 显示延迟 -1** 不一定是故障: 这两个协议走 UDP，而多数客户端（如 v2rayN 的 TCP 测速）测不到 UDP。判断这两个节点要看能否实际上网，不要看延迟数字。
 
 **REALITY: processed invalid connection** 是 Reality 的正常行为: 探测到非客户端流量时回落到伪装站点，不是错误。
+
+### Contabo 用户特别注意
+
+Contabo 的 Firewall 面板默认策略是 **丢弃所有入站流量**，即使显示 `No firewall assigned` 也一样（只有 22 端口被放行防锁死）。所以装完脚本后节点全部超时，不是脚本问题。
+
+在 Contabo 控制台: 服务器 → Firewall → Assign firewall（没有就 Create firewall），添加入站规则:
+
+| 方向 | 协议 | 端口 | 用途 |
+| --- | --- | --- | --- |
+| Inbound | TCP | 22 | SSH（**必须保留**，删掉会失去服务器） |
+| Inbound | TCP | 20338 | VLESS-Reality |
+| Inbound | UDP | 20339 | Hysteria2 |
+| Inbound | UDP | 20340 | TUIC |
+| Inbound | TCP | 20341 | AnyTLS |
+| Inbound | TCP | 20344 | 订阅服务 |
+
+省事做法: 直接放行 `TCP 20338-20347` 与 `UDP 20338-20347` 整段 + `TCP 22`，以后加 trojan / ss2022 / vmess 就不用回来改规则。
+
+规则保存后立即生效，无需重启服务器。Assign 前请再次确认列表里有 22 端口。
